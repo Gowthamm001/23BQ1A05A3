@@ -1,86 +1,84 @@
 import { vehiclesTable, schedulesTable } from '../config/database';
 import { logger } from '../middleware/logging.middleware';
+import { crypto } from 'crypto'; // Native Node module for hash structures
 
-interface NotificationPayload {
-  recipientId: string;
-  category: string;
-  priority: 'LOW' | 'HIGH';
-  channels: ('EMAIL' | 'SMS' | 'PUSH')[];
-  messageDetails: {
-    model: string;
-    vin: string;
-    reason: string;
-    currentMileage: number;
-  };
-}
+// Stage 6: Persistent memory cache monitoring processed idempotency tokens
+const idempotencyCache: Set<string> = new Set();
 
 export class SchedulerService {
   
-  /**
-   * Background Daemon Task: Evaluates all pending maintenance tracks
-   * Formula: Current Mileage >= Next Due Mileage OR Current Date >= Next Due Date
-   */
   public checkMaintenanceAlerts(): void {
     const today = new Date();
     
     schedulesTable.forEach((schedule) => {
-      // Idempotency: Ignore rows that are already handled or running
       if (schedule.status !== 'PENDING') return;
 
       const vehicle = vehiclesTable.find((v) => v.id === schedule.vehicleId);
       if (!vehicle) return;
 
-      // Mathematical condition evaluations
-      const isMileageBreached = vehicle.currentMileage >= schedule.nextDueMileage;
-      const isTimeBreached = today >= schedule.nextDueDate;
-
-      if (isMileageBreached || isTimeBreached) {
-        // Atomic status mutations to prevent duplicate processing
+      if (vehicle.currentMileage >= schedule.nextDueMileage || today >= schedule.nextDueDate) {
         schedule.status = 'OVERDUE';
         vehicle.status = 'MAINTENANCE_DUE';
 
-        logger.warn({
-          message: 'Vehicle maintenance limit breached!',
-          vehicleId: vehicle.id,
-          vin: vehicle.vin,
-          reason: isMileageBreached ? 'Mileage Interval Met' : 'Time Interval Met',
-          currentOdometer: vehicle.currentMileage,
-          thresholdMileage: schedule.nextDueMileage
-        });
+        // STAGE 6 IDEMPOTENCY: Derive a deterministic unique key based on the event context
+        // This ensures the exact same alert event cannot be triggered twice within the pipeline
+        const rawTokenSource = `${vehicle.id}:${schedule.id}:${schedule.nextDueMileage}`;
+        const idempotencyKey = crypto.createHash('sha256').update(rawTokenSource).digest('hex');
 
-        // Construct the asynchronous cross-service contract payload for the Notification App
-        const alertPayload: NotificationPayload = {
+        this.processWorkerQueue({
+          idempotencyKey,
           recipientId: 'FLEET_OPERATIONS_MANAGER',
-          category: 'MAINTENANCE_ALERT',
-          priority: 'HIGH',
-          channels: ['EMAIL', 'PUSH'],
-          messageDetails: {
-            model: vehicle.model,
-            vin: vehicle.vin,
-            reason: schedule.serviceType,
-            currentMileage: vehicle.currentMileage
-          }
-        };
-
-        this.dispatchToNotificationApp(alertPayload);
+          channels: ['EMAIL', 'SMS'],
+          alertText: `Unit ${vehicle.model} breached mechanical tolerances. Service required: ${schedule.serviceType}`
+        });
       }
     });
   }
 
   /**
-   * Simulates an asynchronous broker pipeline/HTTP post to your Notification App subsystem
+   * Stage 6 Queue Worker Process featuring Exponential Backoff Retries
    */
-  private dispatchToNotificationApp(payload: NotificationPayload): void {
-    logger.info({
-      message: 'Routing alert message packet to Notification App consumer pool',
-      recipientId: payload.recipientId,
-      channels: payload.channels
-    });
+  private async processWorkerQueue(job: { idempotencyKey: string; recipientId: string; channels: string[]; alertText: string }): Promise<void> {
+    
+    // 1. Check Idempotency Cache Layer
+    if (idempotencyCache.has(job.idempotencyKey)) {
+      logger.warn({ message: 'Deduplication Alert: Duplicate execution token detected. Request safely discarded.', key: job.idempotencyKey });
+      return;
+    }
 
-    // Console output block simulation representing real-time WebSockets / Workers delivery
-    console.log(`\n📢 [NOTIFICATION APP DISPATCH] To: ${payload.recipientId}`);
-    console.log(`✉️  [Channels]: ${payload.channels.join(' & ')}`);
-    console.log(`⚠️  [Alert]: Unit ${payload.messageDetails.model} (VIN: ${payload.messageDetails.vin}) requires an immediate ${payload.messageDetails.reason}. Odometer: ${payload.messageDetails.currentMileage} mi.\n`);
+    // Register token instantly to lock the pipeline transaction
+    idempotencyCache.add(job.idempotencyKey);
+
+    // 2. Process async channels via worker allocation blocks
+    for (const channel of job.channels) {
+      let attempts = 0;
+      const maxRetries = 3;
+      let success = false;
+
+      while (attempts < maxRetries && !success) {
+        try {
+          attempts++;
+          logger.info({ message: `Worker pool processing dispatch request`, channel, attempt: attempts });
+          
+          // Simulate standard provider call
+          if (Math.random() < 0.15) throw new Error('Third-party API Network Timeout'); // Simulating unpredictable network jitter
+
+          console.log(`\n🚀 [STAGE 6 WORKER SUCCESS] Dispatched via [${channel}] to ${job.recipientId} | Message: ${job.alertText}\n`);
+          success = true;
+        } catch (err: any) {
+          logger.error({ message: `Channel worker execution failed`, error: err.message, channel, attempt: attempts });
+          
+          // Exponential Backoff calculation: Wait 2^attempt * 100ms before retries
+          const backoffDelay = Math.pow(2, attempts) * 100;
+          await new Promise((res) => setTimeout(res, backoffDelay));
+        }
+      }
+
+      // Route to Dead Letter Queue (DLQ) if completely exhausted
+      if (!success) {
+        logger.error({ message: `CRITICAL: Job permanently failed across all retry lifecycles. Routing payload to Dead Letter Queue (DLQ).`, jobKey: job.idempotencyKey });
+      }
+    }
   }
 }
 

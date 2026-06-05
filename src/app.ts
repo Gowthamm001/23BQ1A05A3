@@ -17,6 +17,23 @@ app.use(loggingMiddleware);
 // Stage 2: Core Data Ingestion Endpoints
 app.post('/api/v1/vehicles', registerVehicle);
 
+// Updated background worker loop utilizing Stage 5 Distributed Locking
+setInterval(async () => {
+  const LOCK_KEY = 'cron:maintenance:evaluation';
+  const lockAcquired = await redisLockManager.acquireLock(LOCK_KEY, 15000); // 15s TTL
+
+  if (!lockAcquired) {
+    logger.info({ message: 'Sync Lock Contention: Another server instance is already running the scheduler. Skipping loop.' });
+    return;
+  }
+
+  try {
+    schedulerService.checkMaintenanceAlerts();
+  } finally {
+    // Keep lock active for a short period to prevent instant re-execution spikes
+  }
+}, 30000);
+
 // Modified Ingestion Route: Updates telemetry AND instantly runs Stage 3 scheduler verification
 app.post('/api/v1/vehicles/:id/telemetry', (req, res, next) => {
   // Execute the standard update controller logic
